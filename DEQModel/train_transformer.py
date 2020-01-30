@@ -15,6 +15,12 @@ from models.transformers.deq_transformer import DEQTransformerLM
 from modules import radam
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
+from tensorboardX import SummaryWriter
+import matplotlib.pyplot as plt
+
+from modules.deq import DummyDEQFunc, DEQFunc
+
+plt.switch_backend('agg')
 
 
 parser = argparse.ArgumentParser(description='PyTorch DEQ Sequence Model')
@@ -125,11 +131,13 @@ parser.add_argument('--log-interval', type=int, default=200,
                     help='report interval')
 parser.add_argument('--eval-interval', type=int, default=4000,
                     help='evaluation interval')
+parser.add_argument('--save-interval', type=int, default=2000,
+                    help='save model interval')
 parser.add_argument('--f_thres', type=int, default=50,
                     help='forward pass Broyden threshold')
 parser.add_argument('--b_thres', type=int, default=80,
                     help='backward pass Broyden threshold')
-parser.add_argument('--work_dir', default='LM-TFM', type=str,
+parser.add_argument('--work_dir', default='/mnt/data/deq-original/LM-TFM', type=str,
                     help='experiment directory.')
 parser.add_argument('--restart', action='store_true',
                     help='restart training from the saved checkpoint')
@@ -160,10 +168,12 @@ parser.add_argument('--load', type=str, default='',
                     help='path to load weight')
 parser.add_argument('--name', type=str, default='N/A',
                     help='name of the trial')
+parser.add_argument('--plot_interval', type=int, default=1000,
+                    help='tensorboard plot histogram & figure interval')
 
 args = parser.parse_args()
 args.tied = not args.not_tied
-args.pretrain_steps += args.start_train_steps
+# args.pretrain_steps += args.start_train_steps
 print(f"Experiment name: {args.name}")
 assert args.mem_len > 0, "For now you must set mem_len > 0 when using deq"
 args.work_dir += "deq"
@@ -175,8 +185,8 @@ if args.d_embed < 0:
 assert args.batch_size % args.batch_chunk == 0
 
 args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
-args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d-%H%M%S'))
-logging = create_exp_dir(args.work_dir,
+args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d')+'-'+args.name)
+logging, writer = create_exp_dir(args.work_dir,
     scripts_to_save=['train_transformer.py', 'models/transformers/deq_transformer.py'], debug=args.debug)
 
 # Set the random seed manually for reproducibility.
@@ -268,11 +278,13 @@ def update_dropatt(m):
         m.dropatt.p = args.dropatt
 
 if args.restart:
-    with open(os.path.join(args.restart_dir, 'model.pt'), 'rb') as f:
+    model_ckpt_str = 'model.pt' if args.start_train_steps==0 else f'model-{args.start_train_steps}.pt'
+    with open(os.path.join(args.restart_dir, model_ckpt_str), 'rb') as f:
         model = torch.load(f)
     model = model.float()
     model.apply(update_dropout)
     model.apply(update_dropatt)
+    print(f"Load model ckpt from: {os.path.join(args.restart_dir, model_ckpt_str)}")
 else:
     model = DEQTransformerLM(ntokens, args.n_layer, args.eval_n_layer, args.n_head, args.d_model, args.d_head, args.d_inner,
                              args.dropout, args.dropatt, tie_weights=args.tied, d_embed=args.d_embed,
@@ -315,10 +327,12 @@ elif args.scheduler == 'dev_perf':
         factor=args.decay_rate, patience=args.patience, min_lr=args.lr_min)
 
 if args.restart:
-    if os.path.exists(os.path.join(args.restart_dir, 'optimizer.pt')):
-        with open(os.path.join(args.restart_dir, 'optimizer.pt'), 'rb') as f:
+    optimizer_ckpt_str = 'optimizer.pt' if args.start_train_steps==0 else f'optimizer-{args.start_train_steps}.pt'
+    if os.path.exists(os.path.join(args.restart_dir, optimizer_ckpt_str)):
+        with open(os.path.join(args.restart_dir, optimizer_ckpt_str), 'rb') as f:
             opt_state_dict = torch.load(f)
             optimizer.load_state_dict(opt_state_dict)
+            print(f"Load optimizer ckpt from: {os.path.join(args.restart_dir, optimizer_ckpt_str)}")
     else:
         print('Optimizer was not saved. Start from scratch.')
 
@@ -371,6 +385,7 @@ def train():
 
     for batch, (data, target, seq_len) in enumerate(train_iter):
         model.zero_grad()
+        batch_loss = 0.0
         if args.batch_chunk > 1:
             # Mode 1: Using accumulated gradient to train on a larger (effective) batch size
             data_chunks = data.chunk(args.batch_chunk, dim=1)
@@ -383,8 +398,7 @@ def train():
                 loss, mems[i] = ret[0], ret[1:]         # mems[i]: # 3 x bsz
                 loss = loss.float().mean().type_as(loss) / args.batch_chunk
                 loss.backward()
-                train_loss += loss.float().item()
-                
+                batch_loss += loss.float().item()
         else:
             # Mode 2: Normal training with one batch per iteration
             ret = para_model(data, target, mems, train_step=train_step, f_thres=args.f_thres, 
@@ -392,11 +406,51 @@ def train():
             loss, mems = ret[0], ret[1:]
             loss = loss.float().mean().type_as(loss)
             loss.backward()
-            train_loss += loss.float().item()
-            
+            batch_loss = loss.float().item()
+
+        train_loss += batch_loss
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
         optimizer.step()
         train_step += 1
+
+        # Tensorboard
+        if writer:
+            writer.add_scalar('opt/lr', optimizer.param_groups[0]['lr'], train_step)
+            writer.add_scalar('loss/total', batch_loss, train_step)
+
+            total_norm = 0.0
+            for name, param in para_model.named_parameters():
+                if param.requires_grad:
+                    if train_step % args.plot_interval == 0:
+                        if not (torch.isnan(param).any() or torch.isinf(param).any()):
+                            writer.add_histogram('param/' + name, param.float(), train_step)
+                        if not (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                            writer.add_histogram('grad/' + name, param.grad.float(), train_step)
+
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+                    # print(name, param.grad.max().item(), param.grad.min().item())
+            total_norm = total_norm ** (1. / 2)
+            writer.add_scalar('grad_norm/total', total_norm, train_step)
+
+            if train_step > args.pretrain_steps:
+                writer.add_scalar('deq/forward_reduced_ratio', DEQFunc.forward_reduced_ratio, train_step)
+                writer.add_scalar('deq/backward_reduced_ratio', DummyDEQFunc.backward_reduced_ratio, train_step)
+                writer.add_scalar('deq/forward_steps', DEQFunc.forward_step, train_step)
+                writer.add_scalar('deq/backward_steps', DummyDEQFunc.backward_step, train_step)
+                writer.add_scalar('deq/forward_lowest', DEQFunc.forward_lowest, train_step)
+                writer.add_scalar('deq/backward_lowest', DummyDEQFunc.backward_lowest, train_step)
+                writer.add_scalar('deq/forward_initial', DEQFunc.forward_init, train_step)
+                writer.add_scalar('deq/backward_initial', DummyDEQFunc.backward_init, train_step)
+                if train_step % args.plot_interval == 0:
+                    forward_obj_trace = np.array(DEQFunc.forward_obj_trace)
+                    backward_obj_trace = np.array(DummyDEQFunc.backward_obj_trace)
+                    forward_trace_fig = plt.figure()
+                    plt.plot(np.arange(0, 1 + DEQFunc.forward_step), forward_obj_trace)
+                    writer.add_figure('deq/forward_obj_trace', forward_trace_fig, train_step)
+                    backward_trace_fig = plt.figure()
+                    plt.plot(np.arange(0, 1 + DummyDEQFunc.backward_step), backward_obj_trace)
+                    writer.add_figure('deq/backward_obj_trace', backward_trace_fig, train_step)
 
         # Step-wise learning rate annealing according to some scheduling (we ignore 'constant' scheduling)
         if args.scheduler in ['cosine', 'constant', 'dev_perf']:
@@ -449,8 +503,18 @@ def train():
                 scheduler.step(val_loss)
 
             eval_start_time = time.time()
+
+        if train_step % args.save_interval == 0:
+            if not args.debug:
+                with open(os.path.join(args.work_dir, f'model-{train_step}.pt'), 'wb') as f:
+                    print(f'Saved Model! Experiment name: {args.name}, step: {train_step}')
+                    torch.save(model, f)
+                    # model.save_weights(args.name)
+                with open(os.path.join(args.work_dir, f'optimizer-{train_step}.pt'), 'wb') as f:
+                    torch.save(optimizer.state_dict(), f)
         
-        if train_step == args.pretrain_steps and (args.pretrain_steps - args.start_train_steps) > 4000:
+        # if train_step == args.pretrain_steps and (args.pretrain_steps - args.start_train_steps) > 1000:
+        if train_step == args.pretrain_steps:
             print("You are using pre-training, which has completed :-)")
             model.save_weights(f"pretrain_{train_step}_{args.name}")
             torch.cuda.empty_cache()
@@ -467,16 +531,18 @@ log_start_time = time.time()
 eval_start_time = time.time()
 
 if args.eval:
+    start_time = time.time()
     train_step = 1e9
     epoch = -1
     valid_loss = evaluate(va_iter)
     logging('=' * 100)
-    logging('| End of training | valid loss {:5.2f} | valid ppl {:9.3f}'.format(valid_loss, math.exp(valid_loss)))
+    logging('| End of training | time: {:5.2f}s | valid loss {:5.2f} | valid ppl {:9.3f}'.format((time.time() - start_time), valid_loss, math.exp(valid_loss)))
     logging('=' * 100)
-        
+
+    start_time = time.time()
     test_loss = evaluate(te_iter)
     logging('=' * 100)
-    logging('| End of training | test loss {:5.2f} | test ppl {:9.3f}'.format(test_loss, math.exp(test_loss)))
+    logging('| End of training | time: {:5.2f}s| test loss {:5.2f} | test ppl {:9.3f}'.format((time.time() - start_time), test_loss, math.exp(test_loss)))
     logging('=' * 100)
     sys.exit(0)
 

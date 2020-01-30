@@ -5,6 +5,8 @@ import numpy as np
 
 import torch
 
+from tensorboardX import SummaryWriter
+
 
 def logging(s, log_path, print_=True, log_=True):
     if print_:
@@ -19,7 +21,7 @@ def get_logger(log_path, **kwargs):
 def create_exp_dir(dir_path, scripts_to_save=None, debug=False):
     if debug:
         print('Debug Mode : no experiment dir created')
-        return functools.partial(logging, log_path=None, log_=False)
+        return functools.partial(logging, log_path=None, log_=False), None
 
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
@@ -33,7 +35,10 @@ def create_exp_dir(dir_path, scripts_to_save=None, debug=False):
             dst_file = os.path.join(dir_path, 'scripts', os.path.basename(script))
             shutil.copyfile(script, dst_file)
 
-    return get_logger(log_path=os.path.join(dir_path, 'log.txt'))
+    tb_log_path = os.path.join(dir_path, 'tb_log')
+    writer = SummaryWriter(tb_log_path)
+
+    return get_logger(log_path=os.path.join(dir_path, 'log.txt')), writer
 
 def save_checkpoint(model, optimizer, path, epoch):
     torch.save(model, os.path.join(path, 'model_{}.pt'.format(epoch)))

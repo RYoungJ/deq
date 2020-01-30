@@ -25,6 +25,9 @@ class Vocab(object):
             symbols = line
         else:
             symbols = line.split(self.delimiter)
+        # from transformers import BertTokenizer
+        # tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        # symbols = tokenizer.tokenize(line)
 
         if add_double_eos: # lm1b
             return ['<S>'] + symbols + ['<S>']

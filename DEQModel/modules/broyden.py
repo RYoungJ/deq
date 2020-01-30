@@ -141,6 +141,7 @@ def broyden(g, x0, threshold, eps, ls=False, name="unknown"):
     protect_thres = 1e5 * seq_len
     lowest = new_objective
     lowest_xest, lowest_gx, lowest_step = x_est, gx, nstep
+    # print(">>>", nstep, init_objective)
     while new_objective >= eps and nstep < threshold:
         delta_x, delta_gx, ite = line_search(update, x_est, gx, g, nstep=nstep, on=ls)
         x_est += delta_x
@@ -148,6 +149,7 @@ def broyden(g, x0, threshold, eps, ls=False, name="unknown"):
         nstep += 1
         tnstep += (ite+1)
         new_objective = torch.norm(gx).item()
+        # print(">>>", nstep, new_objective)
         trace.append(new_objective)
         if new_objective < lowest:
             lowest_xest, lowest_gx = x_est.clone().detach(), gx.clone().detach()
@@ -171,16 +173,20 @@ def broyden(g, x0, threshold, eps, ls=False, name="unknown"):
         Us[:,:,:,nstep-1] = u
         update = -matvec(Us[:,:,:,:nstep], VTs[:,:nstep], gx)
 
+    # print(">>4", nstep, lowest / init_objective)
+
     return {"result": lowest_xest,
             "nstep": nstep,
             "tnstep": tnstep,
             "lowest_step": lowest_step,
-            "diff": torch.norm(lowest_gx).item(),
+            "diff": lowest,
+            "init": init_objective,
             "diff_detail": torch.norm(lowest_gx, dim=1),
             "prot_break": prot_break,
             "trace": trace,
             "eps": eps,
-            "threshold": threshold}
+            "threshold": threshold,
+            "reduced_ratio": lowest / init_objective}
 
 
 def analyze_broyden(res_info, err=None, judge=True, name='forward', training=True, save_err=True):

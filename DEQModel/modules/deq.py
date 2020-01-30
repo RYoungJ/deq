@@ -15,6 +15,12 @@ from modules.broyden import broyden, analyze_broyden
 
 class DEQFunc(Function):
     """ Generic DEQ module that uses Broyden's method to find the equilibrium state """
+    forward_step = 0
+    forward_reduced_ratio = 0.0
+    forward_lowest = 0.0
+    forward_init = 0.0
+    forward_obj_trace = []
+
     @staticmethod
     def f(func, z1ss, uss, z0, *args):
         return func(z1ss, uss, z0, *args)
@@ -34,6 +40,12 @@ class DEQFunc(Function):
         result_info = broyden(g, z1ss_est, threshold=threshold, eps=eps, name="forward")
         z1ss_est = result_info['result']
         nstep = result_info['nstep']
+
+        DEQFunc.forward_step = result_info['nstep']
+        DEQFunc.forward_reduced_ratio = result_info['reduced_ratio']
+        DEQFunc.forward_lowest = result_info['diff']
+        DEQFunc.forward_init = result_info['init']
+        DEQFunc.forward_obj_trace = result_info['trace']
 
         if threshold > 100:
             torch.cuda.empty_cache()
@@ -60,6 +72,12 @@ class DEQFunc(Function):
 
 class DummyDEQFunc(Function):
     """ This module is created only to make backward implementation easier. """
+    backward_step = 0
+    backward_reduced_ratio = 0.0
+    backward_lowest = 0.0
+    backward_init = 0.0
+    backward_obj_trace = []
+
     @staticmethod
     def forward(ctx, func_copy, z1ss, uss, z0, *args):
         ctx.save_for_backward(z1ss, uss, z0)
@@ -100,6 +118,12 @@ class DummyDEQFunc(Function):
         result_info = broyden(g, dl_df_est, threshold=threshold, eps=eps, name="backward")
         dl_df_est = result_info['result']
         nstep = result_info['nstep']
+        DummyDEQFunc.backward_step = result_info['nstep']
+        DummyDEQFunc.backward_reduced_ratio = result_info['reduced_ratio']
+        DummyDEQFunc.backward_lowest = result_info['diff']
+        DummyDEQFunc.backward_init = result_info['init']
+        DummyDEQFunc.backward_obj_trace = result_info['trace']
+
         
         y.backward(torch.zeros_like(dl_df_est), retain_graph=False)
 
